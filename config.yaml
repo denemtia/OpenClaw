@@ -1,0 +1,24 @@
+pipeline:
+  chunk_duration_sec: 3600
+  frame_interval_sec: 0.5
+  skip_after_sec: 60
+  clip_offset_pre: 30
+  clip_total_len: 60
+  max_workers: 4
+detection:
+  keyword: "탈락"
+  ocr_lang: "kor+eng"
+  ocr_psm: 6
+roi:
+  x_start: 0.20
+  x_end: 0.80
+  y_start: 0.30
+  y_end: 0.70
+ocr_preprocess:
+  upscale_factor: 2
+  denoise_h: 10
+  use_adaptive_threshold: true
+thumbnails:
+  enabled: true
+  width: 320
+  quality: 90

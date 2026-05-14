@@ -1,0 +1,16 @@
+*.mp4
+*.avi
+*.mkv
+*.mov
+input/
+output/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.log
+list.txt
+.env
+credentials.json
+progress.json
