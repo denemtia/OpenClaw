@@ -396,6 +396,51 @@ def scan_once(processed: set) -> set:
 #  메인
 # ════════════════════════════════════════════════════════════════
 
+# ════════════════════════════════════════════════════════════════
+#  "편집 실행" 명령 처리 — 최신 파일 즉시 처리
+# ════════════════════════════════════════════════════════════════
+
+def run_latest_file():
+    """
+    텔레그램에서 '편집 실행' 수신 시:
+    /Volumes/영상 녹화2/ 에서 가장 최근 .mkv 파일을 즉시 처리.
+    """
+    if not WATCH_PATH.exists():
+        send_telegram(
+            f"⚠️ 네트워크 드라이브 연결 끊김\n"
+            f"📂 {WATCH_PATH}\n"
+            f"Finder에서 다시 연결해주세요"
+        )
+        return
+
+    all_mkv = sorted(
+        WATCH_PATH.glob("*.mkv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
+
+    if not all_mkv:
+        send_telegram("⚠️ 감시 경로에 .mkv 파일이 없습니다")
+        return
+
+    latest = all_mkv[0]
+    size_gb = latest.stat().st_size / (1024 ** 3)
+    mtime = datetime.fromtimestamp(latest.stat().st_mtime).strftime("%m/%d %H:%M")
+
+    send_telegram(
+        f"▶️ 편집 실행 — 최신 파일 처리 시작\n"
+        f"📁 {latest.name}\n"
+        f"📅 {mtime}  💾 {size_gb:.1f}GB"
+    )
+    log.info(f"  [편집 실행] 최신 파일 처리: {latest.name}")
+
+    try:
+        run_openclaw(latest)
+    except Exception as e:
+        log.error(f"  ✗ 편집 실행 실패: {e}")
+        send_telegram(f"❌ 편집 실행 실패\n오류: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="OpenClaw Watcher v3")
     parser.add_argument("--once",  action="store_true", help="1회 스캔 후 종료")
@@ -406,7 +451,7 @@ def main():
     args = parser.parse_args()
 
     log.info("═" * 48)
-    log.info("  OpenClaw Watcher v3.0 시작")
+    log.info("  OpenClaw Watcher v3.1 시작")
     log.info(f"  감시 경로  : {WATCH_PATH}")
     log.info(f"  결과물 경로: {OUTPUT_DIR}")
     log.info(f"  폴링 간격  : {args.poll}초")
@@ -418,18 +463,18 @@ def main():
             PROCESSED_LOG.unlink()
         log.info("  처리 완료 목록 초기화됨\n")
 
-    # 네트워크 경로 확인
-    if not check_mount():
-        log.error(f"  감시 경로 접근 불가: {WATCH_PATH}")
-        sys.exit(1)
+    # 네트워크 경로 확인 (--once 제외)
+    if not args.once and not WATCH_PATH.exists():
+        log.warning(f"  감시 경로 없음 (나중에 마운트 시 자동 재시도): {WATCH_PATH}")
 
     processed = load_processed()
     log.info(f"  기처리 파일: {len(processed)}개\n")
 
     send_telegram(
-        f"🦞 OpenClaw Watcher v3.0 시작!\n"
+        f"🦞 OpenClaw Watcher v3.1 시작!\n"
         f"📂 감시 중: {WATCH_PATH.name}\n"
-        f"⏱ 스캔 간격: {args.poll}초"
+        f"⏱ 스캔 간격: {args.poll}초\n"
+        f"💬 '편집 실행' 전송 시 최신 파일 즉시 처리"
     )
 
     if args.once:
@@ -437,11 +482,33 @@ def main():
         log.info("  [--once] 완료")
         return
 
+    # 텔레그램 update_id 초기화 (기존 메시지 무시)
+    last_update_id = get_last_update_id()
+
     try:
         while True:
+            # ── 텔레그램 명령 확인 ──────────────────────────────
+            text, last_update_id = get_latest_reply(last_update_id)
+            if text:
+                cmd = text.strip()
+                log.info(f"  [텔레그램 명령] '{cmd}'")
+                if cmd in ("편집 실행", "편집실행", "/edit", "edit"):
+                    run_latest_file()
+                elif cmd in ("상태", "status", "/status"):
+                    mounted = WATCH_PATH.exists()
+                    send_telegram(
+                        f"📊 OpenClaw 상태\n"
+                        f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
+                        f"{'연결됨' if mounted else '연결 끊김'}\n"
+                        f"📝 처리 완료 파일: {len(processed)}개"
+                    )
+                # 그 외 메시지는 무시 (wait_for_selection에서 처리)
+
+            # ── 정기 스캔 ────────────────────────────────────────
             processed = scan_once(processed)
             log.info(f"  {args.poll}초 대기...\n")
             time.sleep(args.poll)
+
     except KeyboardInterrupt:
         log.info("\n  watcher 종료")
         send_telegram("🛑 OpenClaw Watcher 종료")

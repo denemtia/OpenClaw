@@ -29,12 +29,7 @@ try:
 except ImportError:
     TELEGRAM_ENABLED = False
 
-# ── Google Drive 업로드 (선택) ────────────────────────────────
-try:
-    from uploader import upload_to_drive
-    DRIVE_ENABLED = True
-except ImportError:
-    DRIVE_ENABLED = False
+DRIVE_ENABLED = False  # Google Drive 업로드 미사용
 
 
 # ════════════════════════════════════════════════════════════════
@@ -289,26 +284,7 @@ def process_video(video_path: str):
             }
             detections.append(detection)
 
-            # 텔레그램 알림
-            if TELEGRAM_ENABLED:
-                msg = (f"🎬 탈락 #{kill_count:02d} 감지!\n"
-                       f"📁 {src.name}\n"
-                       f"⏱ {seconds_to_hhmmss(detect_sec)} "
-                       f"({seconds_to_timecode(detect_sec)})\n"
-                       f"✂️ {seconds_to_hhmmss(clip_start)} ~ "
-                       f"{seconds_to_hhmmss(clip_end)}")
-                try:
-                    send_telegram(msg)
-                except Exception as e:
-                    print(f"  [WARN] 텔레그램 전송 실패: {e}")
-
-            # Google Drive 업로드
-            if DRIVE_ENABLED and ok:
-                try:
-                    upload_to_drive(str(clip_path))
-                    print(f"       Drive 업로드 ✓")
-                except Exception as e:
-                    print(f"  [WARN] Drive 업로드 실패: {e}")
+            # 탈락 감지마다 알람 없음 — 분석 완료 시 watcher.py에서 일괄 전송
 
             i += cooldown_frames  # 쿨타임 적용
         else:

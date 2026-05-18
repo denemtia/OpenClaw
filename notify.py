@@ -15,7 +15,7 @@ try:
 except ImportError:
     pass
 
-TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
