@@ -1,326 +1,344 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-OpenClaw v3.0.0 - 자동 하이라이트 추출 파이프라인
+OpenClaw v5.1.0
+─────────────────────────────────────────
+변경사항 (v5.0.0 → v5.1.0):
+  - 감지된 탈락 장면을 개별 클립으로 분리 저장
+  - 각 클립에 원본 타임코드 기록 (CSV + JSON)
+  - 프리미어 프로용 EDL 간소화 버전 포함
+  - 결과물 폴더 자동 정리 구조
+
+사용법:
+  python openclaw.py <영상파일.mkv>
+  python openclaw.py <영상파일.mkv> --no-telegram
 """
-import os, sys, json, subprocess, shutil
-from datetime import datetime
+
+import cv2
+import pytesseract
+import subprocess
+import os
+import sys
+import csv
+import json
+import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ── 텔레그램 (선택) ───────────────────────────────────────────
 try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).parent / ".env")
+    from notify import send_telegram
+    TELEGRAM_ENABLED = "--no-telegram" not in sys.argv
 except ImportError:
-    pass
+    TELEGRAM_ENABLED = False
 
+# ── Google Drive 업로드 (선택) ────────────────────────────────
 try:
-    import cv2
-    CV2_AVAILABLE = True
+    from uploader import upload_to_drive
+    DRIVE_ENABLED = True
 except ImportError:
-    CV2_AVAILABLE = False
+    DRIVE_ENABLED = False
 
-try:
-    import pytesseract
-    TESSERACT_AVAILABLE = True
-except ImportError:
-    TESSERACT_AVAILABLE = False
 
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
+# ════════════════════════════════════════════════════════════════
+#  설정값
+# ════════════════════════════════════════════════════════════════
 
-try:
-    import notify as _notify
-    def _n(fn, *a, **kw):
-        try: fn(*a, **kw)
-        except Exception: pass
-except ImportError:
-    class _notify:
-        notify_start = notify_split_done = notify_event_detected = staticmethod(lambda *a,**kw: None)
-        notify_clip_created = notify_merge_done = notify_upload_done = staticmethod(lambda *a,**kw: None)
-        notify_error = notify_progress = staticmethod(lambda *a,**kw: None)
-    def _n(fn, *a, **kw): pass
+# ROI — 검증된 좌표 (x: 28~58%, y: 62~78%)
+ROI_X1_RATIO = 0.28
+ROI_X2_RATIO = 0.58
+ROI_Y1_RATIO = 0.62
+ROI_Y2_RATIO = 0.78
 
-try:
-    from uploader import upload as _drive_upload
-    DRIVE_AVAILABLE = True
-except ImportError:
-    DRIVE_AVAILABLE = False
-    def _drive_upload(*a, **kw): return None
+SCAN_INTERVAL_SEC   = 0.5   # 0.5초 간격 스캔
+COOLDOWN_SEC        = 60    # 감지 후 60초 쿨타임
+CLIP_BEFORE_SEC     = 30    # 탈락 장면 앞 30초
+CLIP_AFTER_SEC      = 30    # 탈락 장면 뒤 30초
 
-SCRIPT_DIR  = Path(__file__).parent
-CONFIG_FILE = SCRIPT_DIR / "config.yaml"
-DEFAULT_CONFIG = {
-    "pipeline":  {"chunk_duration_sec":3600,"frame_interval_sec":0.5,"skip_after_sec":60,"clip_offset_pre":30,"clip_total_len":60,"max_workers":4},
-    "detection": {"keyword":"탈락","ocr_lang":"kor+eng","ocr_psm":6},
-    "roi":       {"x_start":0.20,"x_end":0.80,"y_start":0.30,"y_end":0.70},
-    "ocr_preprocess": {"upscale_factor":2,"denoise_h":10,"use_adaptive_threshold":True},
-    "thumbnails":{"enabled":True,"width":320,"quality":90},
-}
+KEYWORD             = "탈락"
+OCR_LANG            = "kor"
+OCR_CONFIG          = "--psm 6"
 
-def load_config():
-    if YAML_AVAILABLE and CONFIG_FILE.exists():
-        with open(CONFIG_FILE,"r",encoding="utf-8") as f:
-            loaded = yaml.safe_load(f) or {}
-        merged = {k: dict(v) for k,v in DEFAULT_CONFIG.items()}
-        for s,v in loaded.items():
-            if s in merged and isinstance(v,dict): merged[s].update(v)
-            else: merged[s]=v
-        return merged
-    return {k: dict(v) for k,v in DEFAULT_CONFIG.items()}
 
-CFG = load_config()
-PC,DC,RC,OC,TC = CFG["pipeline"],CFG["detection"],CFG["roi"],CFG["ocr_preprocess"],CFG["thumbnails"]
+# ════════════════════════════════════════════════════════════════
+#  타임코드 유틸
+# ════════════════════════════════════════════════════════════════
 
-BASE_DIR      = Path.home()/"Desktop"/"OpenClaw"
-INPUT_FILE    = BASE_DIR/"input"/"vod_latest.mp4"
-CHUNKS_DIR    = BASE_DIR/"input"/"chunks"
-CLIPS_DIR     = BASE_DIR/"input"/"clips"
-OUTPUT_DIR    = BASE_DIR/"output"
-THUMBS_DIR    = OUTPUT_DIR/"thumbs"
-PROGRESS_FILE = BASE_DIR/"progress.json"
+def seconds_to_timecode(seconds: float) -> str:
+    """초 → HH:MM:SS:FF (30fps 기준) 타임코드"""
+    h  = int(seconds // 3600)
+    m  = int((seconds % 3600) // 60)
+    s  = int(seconds % 60)
+    ff = int((seconds - int(seconds)) * 30)
+    return f"{h:02d}:{m:02d}:{s:02d}:{ff:02d}"
 
-def log(msg, level="INFO"):
-    icons={"INFO":"✅","WARN":"⚠️ ","ERROR":"❌","STEP":"🔷","SKIP":"⏭️ "}
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {icons.get(level,'  ')} {msg}",flush=True)
+def seconds_to_hhmmss(seconds: float) -> str:
+    """초 → HH:MM:SS (가독용)"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
-def load_progress():
-    if PROGRESS_FILE.exists():
-        try:
-            with open(PROGRESS_FILE,"r",encoding="utf-8") as f: return json.load(f)
-        except: pass
-    return {"completed_chunks":[],"events":[],"clips":[],"split_done":False}
 
-def save_progress(p):
-    try:
-        with open(PROGRESS_FILE,"w",encoding="utf-8") as f: json.dump(p,f,ensure_ascii=False,indent=2)
-    except Exception as e: log(f"진행 저장 실패: {e}","WARN")
+# ════════════════════════════════════════════════════════════════
+#  클립 추출
+# ════════════════════════════════════════════════════════════════
 
-def clear_progress():
-    if PROGRESS_FILE.exists(): PROGRESS_FILE.unlink()
+def extract_clip(src_path: str, start_sec: float, end_sec: float,
+                 out_path: str) -> bool:
+    """
+    ffmpeg으로 개별 클립 추출.
+    -ss를 input 앞에 두면 keyframe seek로 빠르고,
+    -accurate_seek로 정밀 컷 보정.
+    """
+    duration = end_sec - start_sec
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(max(0, start_sec)),
+        "-i", src_path,
+        "-t", str(duration),
+        "-c:v", "libx264", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    result = subprocess.run(cmd, capture_output=True)
+    return result.returncode == 0
 
-def ensure_dirs():
-    for d in [BASE_DIR/"input",CHUNKS_DIR,CLIPS_DIR,OUTPUT_DIR,THUMBS_DIR]:
-        os.makedirs(d,exist_ok=True)
-    log(f"작업 폴더 확인: {BASE_DIR}")
 
-def check_deps():
-    for t,i in [("ffmpeg","brew install ffmpeg"),("ffprobe","brew install ffmpeg")]:
-        if shutil.which(t) is None:
-            log(f"{t} 없음 → {i}","ERROR"); sys.exit(1)
-    log("의존성 확인 완료")
+# ════════════════════════════════════════════════════════════════
+#  타임코드 기록 저장
+# ════════════════════════════════════════════════════════════════
 
-def get_video_duration(path):
-    try:
-        r=subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
-            "-of","default=noprint_wrappers=1:nokey=1",str(path)],
-            capture_output=True,text=True,timeout=30)
-        v=r.stdout.strip()
-        return float(v) if v else float(PC["chunk_duration_sec"])
-    except: return float(PC["chunk_duration_sec"])
+def save_timecode_log(detections: list, out_dir: Path, video_name: str):
+    """
+    detections: [{"index": 1, "detect_sec": 123.4, "clip_start": 93.4,
+                   "clip_end": 153.4, "clip_file": "..._kill_01.mp4"}, ...]
 
-def run_ffmpeg(cmd, label=""):
-    try:
-        r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=7200)
-        if r.returncode!=0: log(f"ffmpeg 오류 ({label}): {r.stderr[-300:]}","WARN"); return False
-        return True
-    except subprocess.TimeoutExpired: log(f"ffmpeg 타임아웃 ({label})","WARN"); return False
-    except Exception as e: log(f"ffmpeg 예외 ({label}): {e}","ERROR"); return False
+    저장 형식:
+      1. timecode_log.csv  — 프리미어에서 열기 쉬운 CSV
+      2. timecode_log.json — 추후 자동화용
+      3. markers.edl       — 프리미어 마커 가이드 (텍스트 참고용)
+    """
+    if not detections:
+        return
 
-def preprocess_for_ocr(gray):
-    img=gray.copy()
-    h=int(OC.get("denoise_h",10))
-    if h>0: img=cv2.fastNlMeansDenoising(img,h=h)
-    s=float(OC.get("upscale_factor",2))
-    if s>1: img=cv2.resize(img,None,fx=s,fy=s,interpolation=cv2.INTER_CUBIC)
-    if OC.get("use_adaptive_threshold",True):
-        img=cv2.adaptiveThreshold(img,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY,11,2)
+    # ── 1. CSV ───────────────────────────────────────────────
+    csv_path = out_dir / "timecode_log.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "번호",
+            "감지 시각 (HH:MM:SS)",
+            "감지 타임코드 (HH:MM:SS:FF)",
+            "감지 초",
+            "클립 시작 (HH:MM:SS)",
+            "클립 종료 (HH:MM:SS)",
+            "클립 시작 초",
+            "클립 종료 초",
+            "클립 파일명",
+            "원본 파일"
+        ])
+        for d in detections:
+            writer.writerow([
+                d["index"],
+                seconds_to_hhmmss(d["detect_sec"]),
+                seconds_to_timecode(d["detect_sec"]),
+                f"{d['detect_sec']:.2f}",
+                seconds_to_hhmmss(d["clip_start"]),
+                seconds_to_hhmmss(d["clip_end"]),
+                f"{d['clip_start']:.2f}",
+                f"{d['clip_end']:.2f}",
+                d["clip_file"],
+                video_name
+            ])
+    print(f"  [LOG] CSV 저장 → {csv_path.name}")
+
+    # ── 2. JSON ──────────────────────────────────────────────
+    json_path = out_dir / "timecode_log.json"
+    payload = {
+        "source_video": video_name,
+        "generated_at": datetime.datetime.now().isoformat(),
+        "total_detections": len(detections),
+        "detections": [
+            {
+                **d,
+                "detect_timecode": seconds_to_timecode(d["detect_sec"]),
+                "detect_hhmmss":   seconds_to_hhmmss(d["detect_sec"]),
+                "clip_start_hhmmss": seconds_to_hhmmss(d["clip_start"]),
+                "clip_end_hhmmss":   seconds_to_hhmmss(d["clip_end"]),
+            }
+            for d in detections
+        ]
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  [LOG] JSON 저장 → {json_path.name}")
+
+    # ── 3. 프리미어 마커 가이드 텍스트 ──────────────────────
+    edl_path = out_dir / "premiere_markers.txt"
+    with open(edl_path, "w", encoding="utf-8") as f:
+        f.write(f"# OpenClaw — 프리미어 프로 마커 가이드\n")
+        f.write(f"# 원본 파일: {video_name}\n")
+        f.write(f"# 생성일시: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# 총 탈락 감지: {len(detections)}건\n")
+        f.write("─" * 60 + "\n\n")
+        f.write("[ 프리미어 프로 사용법 ]\n")
+        f.write("1. 원본 영상을 타임라인에 올린다\n")
+        f.write("2. 아래 타임코드 위치로 이동 (단축키: Ctrl+G → 타임코드 입력)\n")
+        f.write("3. M키로 마커 추가, 클립명 참고\n\n")
+        f.write("─" * 60 + "\n\n")
+        for d in detections:
+            f.write(f"탈락 #{d['index']:02d}\n")
+            f.write(f"  감지 위치  : {seconds_to_hhmmss(d['detect_sec'])}  "
+                    f"({seconds_to_timecode(d['detect_sec'])})\n")
+            f.write(f"  클립 구간  : {seconds_to_hhmmss(d['clip_start'])} ~ "
+                    f"{seconds_to_hhmmss(d['clip_end'])}\n")
+            f.write(f"  클립 파일  : {d['clip_file']}\n\n")
+    print(f"  [LOG] 프리미어 마커 가이드 → {edl_path.name}")
+
+
+# ════════════════════════════════════════════════════════════════
+#  썸네일 저장
+# ════════════════════════════════════════════════════════════════
+
+def save_thumbnail(frame, out_dir: Path, index: int):
+    thumb_path = out_dir / f"thumb_{index:02d}.jpg"
+    cv2.imwrite(str(thumb_path), frame)
+    return thumb_path.name
+
+
+# ════════════════════════════════════════════════════════════════
+#  메인 처리
+# ════════════════════════════════════════════════════════════════
+
+def process_video(video_path: str):
+    src = Path(video_path)
+    if not src.exists():
+        print(f"[ERROR] 파일 없음: {video_path}")
+        sys.exit(1)
+
+    # 결과물 폴더: 원본명_openclaw/
+    out_dir = src.parent / f"{src.stem}_openclaw"
+    out_dir.mkdir(exist_ok=True)
+    print(f"\n{'═'*55}")
+    print(f"  OpenClaw v5.1.0")
+    print(f"  원본 : {src.name}")
+    print(f"  출력 : {out_dir}")
+    print(f"{'═'*55}\n")
+
+    cap = cv2.VideoCapture(str(src))
+    if not cap.isOpened():
+        print("[ERROR] 영상을 열 수 없음")
+        sys.exit(1)
+
+    fps        = cap.get(cv2.CAP_PROP_FPS) or 30
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_sec  = total_frames / fps
+
+    step_frames   = int(fps * SCAN_INTERVAL_SEC)
+    cooldown_frames = int(fps * COOLDOWN_SEC)
+
+    print(f"  FPS: {fps:.2f}  |  총 길이: {seconds_to_hhmmss(total_sec)}")
+    print(f"  스캔 간격: {SCAN_INTERVAL_SEC}s  |  쿨타임: {COOLDOWN_SEC}s\n")
+
+    detections = []
+    kill_count = 0
+    i = 0
+
+    while i < total_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        h, w = frame.shape[:2]
+        x1 = int(w * ROI_X1_RATIO)
+        x2 = int(w * ROI_X2_RATIO)
+        y1 = int(h * ROI_Y1_RATIO)
+        y2 = int(h * ROI_Y2_RATIO)
+
+        roi  = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(roi, 0, 255,
+                                  cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        txt = pytesseract.image_to_string(binary, lang=OCR_LANG,
+                                          config=OCR_CONFIG)
+
+        if KEYWORD in txt:
+            kill_count += 1
+            detect_sec  = i / fps
+            clip_start  = max(0.0, detect_sec - CLIP_BEFORE_SEC)
+            clip_end    = min(total_sec, detect_sec + CLIP_AFTER_SEC)
+            clip_name   = f"{src.stem}_kill_{kill_count:02d}.mp4"
+            clip_path   = out_dir / clip_name
+            thumb_name  = save_thumbnail(frame, out_dir, kill_count)
+
+            print(f"  ✂  탈락 #{kill_count:02d}  감지: {seconds_to_hhmmss(detect_sec)}"
+                  f"  ({seconds_to_timecode(detect_sec)})")
+            print(f"       클립 구간: {seconds_to_hhmmss(clip_start)} ~ "
+                  f"{seconds_to_hhmmss(clip_end)}")
+            print(f"       추출 중... ", end="", flush=True)
+
+            ok = extract_clip(str(src), clip_start, clip_end, str(clip_path))
+            print("완료 ✓" if ok else "실패 ✗")
+
+            detection = {
+                "index":      kill_count,
+                "detect_sec": round(detect_sec, 2),
+                "clip_start": round(clip_start, 2),
+                "clip_end":   round(clip_end, 2),
+                "clip_file":  clip_name,
+                "thumb_file": thumb_name,
+            }
+            detections.append(detection)
+
+            # 텔레그램 알림
+            if TELEGRAM_ENABLED:
+                msg = (f"🎬 탈락 #{kill_count:02d} 감지!\n"
+                       f"📁 {src.name}\n"
+                       f"⏱ {seconds_to_hhmmss(detect_sec)} "
+                       f"({seconds_to_timecode(detect_sec)})\n"
+                       f"✂️ {seconds_to_hhmmss(clip_start)} ~ "
+                       f"{seconds_to_hhmmss(clip_end)}")
+                try:
+                    send_telegram(msg)
+                except Exception as e:
+                    print(f"  [WARN] 텔레그램 전송 실패: {e}")
+
+            # Google Drive 업로드
+            if DRIVE_ENABLED and ok:
+                try:
+                    upload_to_drive(str(clip_path))
+                    print(f"       Drive 업로드 ✓")
+                except Exception as e:
+                    print(f"  [WARN] Drive 업로드 실패: {e}")
+
+            i += cooldown_frames  # 쿨타임 적용
+        else:
+            i += step_frames
+
+    cap.release()
+
+    # ── 타임코드 로그 저장 ────────────────────────────────────
+    print(f"\n{'─'*55}")
+    print(f"  총 탈락 감지: {kill_count}건")
+    if kill_count > 0:
+        save_timecode_log(detections, out_dir, src.name)
+        print(f"\n  📂 결과물 위치: {out_dir}")
+        print(f"  ├─ 클립 파일   : *_kill_XX.mp4 ({kill_count}개)")
+        print(f"  ├─ 썸네일      : thumb_XX.jpg ({kill_count}개)")
+        print(f"  ├─ timecode_log.csv   ← 프리미어에서 바로 열기")
+        print(f"  ├─ timecode_log.json  ← 자동화용")
+        print(f"  └─ premiere_markers.txt  ← 마커 가이드")
     else:
-        _,img=cv2.threshold(img,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-    return img
+        print("  탈락 장면이 감지되지 않았습니다.")
+    print(f"{'═'*55}\n")
 
-def save_thumbnail(frame, idx, abs_sec):
-    if not TC.get("enabled",True): return
-    try:
-        tw=int(TC.get("width",320)); fh,fw=frame.shape[:2]; th=int(fh*tw/fw)
-        thumb=cv2.resize(frame,(tw,th))
-        fname=THUMBS_DIR/f"thumb_{idx:03d}_t{int(abs_sec)}s.jpg"
-        cv2.imwrite(str(fname),thumb,[cv2.IMWRITE_JPEG_QUALITY,int(TC.get("quality",90))])
-        log(f"  📸 썸네일: {fname.name}")
-    except Exception as e: log(f"  썸네일 실패: {e}","WARN")
 
-def step1_split(progress):
-    log("="*52,"STEP"); log("[Step 1] 무손실 분할","STEP"); log("="*52,"STEP")
-    if not INPUT_FILE.exists():
-        log(f"원본 영상 없음: {INPUT_FILE}","ERROR"); sys.exit(1)
-    existing=sorted(CHUNKS_DIR.glob("chunk_*.mp4"))
-    if existing and progress.get("split_done"):
-        log(f"이전 분할 재사용: {len(existing)}개","SKIP"); return existing
-    for f in CHUNKS_DIR.glob("chunk_*.mp4"): f.unlink()
-    cmd=["ffmpeg","-y","-i",str(INPUT_FILE),"-c","copy","-f","segment",
-         "-segment_time",str(PC["chunk_duration_sec"]),"-reset_timestamps","1",
-         str(CHUNKS_DIR/"chunk_%03d.mp4")]
-    if not run_ffmpeg(cmd,"segment split"):
-        log("분할 실패 → 단일 chunk","WARN")
-        shutil.copy(INPUT_FILE,CHUNKS_DIR/"chunk_000.mp4")
-    chunks=sorted(CHUNKS_DIR.glob("chunk_*.mp4"))
-    log(f"분할 완료: {len(chunks)}개")
-    for c in chunks: log(f"  - {c.name} ({c.stat().st_size/1024/1024:.1f} MB)")
-    progress["split_done"]=True; save_progress(progress)
-    return chunks
-
-def _analyze_single_chunk(chunk_path, chunk_offset_sec, already_done):
-    events=[]
-    if chunk_path.name in already_done:
-        log(f"  [재개] 스킵: {chunk_path.name}","SKIP"); return events
-    if not (CV2_AVAILABLE and TESSERACT_AVAILABLE):
-        log(f"  OCR 없음 → {chunk_path.name} 건너뜀","WARN"); return events
-    try:
-        cap=cv2.VideoCapture(str(chunk_path))
-        if not cap.isOpened(): log(f"  열기 실패: {chunk_path.name}","WARN"); return events
-        fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
-        step_frames=max(1,int(fps*float(PC["frame_interval_sec"])))
-        total_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        log(f"  📂 {chunk_path.name} | {fps:.0f}fps | {total_frames/fps:.0f}s | offset={chunk_offset_sec:.0f}s")
-        skip_until_sec=-1.0; frame_idx=0
-        while True:
-            cap.set(cv2.CAP_PROP_POS_FRAMES,frame_idx)
-            ret,frame=cap.read()
-            if not ret: break
-            current_sec=frame_idx/fps; absolute_sec=chunk_offset_sec+current_sec
-            if current_sec<skip_until_sec: frame_idx+=step_frames; continue
-            fh,fw=frame.shape[:2]
-            x1,x2=int(fw*float(RC["x_start"])),int(fw*float(RC["x_end"]))
-            y1,y2=int(fh*float(RC["y_start"])),int(fh*float(RC["y_end"]))
-            roi=frame[y1:y2,x1:x2]
-            gray=cv2.cvtColor(roi,cv2.COLOR_BGR2GRAY)
-            processed=preprocess_for_ocr(gray)
-            try:
-                text=pytesseract.image_to_string(processed,lang=DC["ocr_lang"],
-                     config=f"--psm {DC['ocr_psm']}")
-            except:
-                try: text=pytesseract.image_to_string(processed,config=f"--psm {DC['ocr_psm']}")
-                except: text=""
-            if DC["keyword"] in text:
-                log(f"  🎯 탈락! local={current_sec:.1f}s abs={absolute_sec:.1f}s")
-                save_thumbnail(frame,len(events),absolute_sec)
-                events.append({"absolute_time":absolute_sec,"chunk_name":chunk_path.name,
-                    "chunk_path":str(chunk_path),"local_time":current_sec,"chunk_offset":chunk_offset_sec})
-                _n(_notify.notify_event_detected,len(events),absolute_sec)
-                skip_until_sec=current_sec+float(PC["skip_after_sec"])
-            frame_idx+=step_frames
-        cap.release()
-        log(f"  ✅ {chunk_path.name} 완료 | {len(events)}건")
-    except Exception as e: log(f"  예외 ({chunk_path.name}): {e}","WARN")
-    return events
-
-def step2_analyze_and_clip(chunks, progress):
-    log("="*52,"STEP"); log("[Step 2] ROI 분석 + 클립 생성","STEP"); log("="*52,"STEP")
-    offsets=[]; acc=0.0
-    for chunk in chunks: offsets.append(acc); acc+=get_video_duration(chunk)
-    already_done=list(progress.get("completed_chunks",[]))
-    all_events=list(progress.get("events",[]))
-    max_w=min(int(PC["max_workers"]),len(chunks))
-    log(f"병렬 분석: workers={max_w}")
-    with ThreadPoolExecutor(max_workers=max_w) as pool:
-        futures={pool.submit(_analyze_single_chunk,chunk,offsets[i],already_done):chunk
-                 for i,chunk in enumerate(chunks)}
-        for future in as_completed(futures):
-            chunk=futures[future]
-            try:
-                evts=future.result(); all_events.extend(evts)
-                already_done.append(chunk.name)
-                progress["completed_chunks"]=already_done
-                progress["events"]=all_events
-                save_progress(progress)
-            except Exception as e: log(f"예외 ({chunk.name}): {e}","WARN")
-    all_events.sort(key=lambda e:e["absolute_time"])
-    log(f"전체 이벤트: {len(all_events)}건")
-    if not all_events: log("이벤트 없음.","WARN"); return []
-    clips=[]; already_clips=list(progress.get("clips",[]))
-    for idx,event in enumerate(all_events):
-        clip_name=f"clip_{idx+1:03d}_t{int(event['absolute_time'])}s.mp4"
-        clip_path=CLIPS_DIR/clip_name
-        if clip_name in already_clips and clip_path.exists():
-            clips.append(clip_path); continue
-        abs_t=event["absolute_time"]; loc_t=event["local_time"]; success=False
-        if INPUT_FILE.exists():
-            start_t=max(0.0,abs_t-float(PC["clip_offset_pre"]))
-            success=run_ffmpeg(["ffmpeg","-y","-ss",str(start_t),"-i",str(INPUT_FILE),
-                "-t",str(PC["clip_total_len"]),"-c","copy",str(clip_path)],f"clip {idx+1}")
-        if not success:
-            cp=Path(event["chunk_path"])
-            if cp.exists():
-                ls=max(0.0,loc_t-float(PC["clip_offset_pre"]))
-                success=run_ffmpeg(["ffmpeg","-y","-ss",str(ls),"-i",str(cp),
-                    "-t",str(PC["clip_total_len"]),"-c","copy",str(clip_path)],f"clip {idx+1} fallback")
-        if success and clip_path.exists():
-            clips.append(clip_path); already_clips.append(clip_name)
-            progress["clips"]=already_clips; save_progress(progress)
-            log(f"  클립 저장: {clip_name}")
-        else: log(f"  클립 실패: {clip_name}","WARN")
-    log(f"클립 완료: {len(clips)}개")
-    return clips
-
-def step3_merge(clips, progress):
-    log("="*52,"STEP"); log("[Step 3] 병합 → 최종 출력","STEP"); log("="*52,"STEP")
-    if not clips: log("병합할 클립 없음.","WARN"); return None
-    list_txt=CLIPS_DIR/"list.txt"
-    with open(list_txt,"w",encoding="utf-8") as f:
-        for clip in sorted(clips): f.write(f"file '{str(clip)}'\n")
-    ts=datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file=OUTPUT_DIR/f"final_{ts}.mp4"
-    if run_ffmpeg(["ffmpeg","-y","-f","concat","-safe","0","-i",str(list_txt),"-c","copy",str(output_file)],"merge") and output_file.exists():
-        size_mb=output_file.stat().st_size/1024/1024
-        log(f"최종 저장: {output_file.name} ({size_mb:.1f} MB)")
-        clear_progress(); return output_file
-    log("병합 실패","ERROR"); return None
-
-def main():
-    print()
-    print("╔══════════════════════════════════════════╗")
-    print("║   🦞  OpenClaw  v3.0.0                   ║")
-    print("║   자동 하이라이트 추출 파이프라인         ║")
-    print("╚══════════════════════════════════════════╝")
-    print()
-    start_time=datetime.now()
-    ensure_dirs(); check_deps()
-    progress=load_progress()
-    if progress.get("completed_chunks"):
-        done=len(progress["completed_chunks"]); evts=len(progress.get("events",[]))
-        log(f"재개 모드 (chunk {done}개, 이벤트 {evts}건)")
-        _n(_notify.notify_progress,"재개 모드",f"chunk {done}개, 이벤트 {evts}건")
-    else:
-        log("새 작업 시작"); _n(_notify.notify_start,INPUT_FILE.name)
-    try:
-        chunks=step1_split(progress)
-        _n(_notify.notify_split_done,len(chunks))
-        clips=step2_analyze_and_clip(chunks,progress)
-        result=step3_merge(clips,progress)
-    except SystemExit: raise
-    except Exception as e:
-        log(f"치명적 오류: {e}","ERROR")
-        _n(_notify.notify_error,"파이프라인",str(e)); sys.exit(1)
-    elapsed=(datetime.now()-start_time).total_seconds()
-    mins,secs=divmod(int(elapsed),60)
-    if result:
-        _n(_notify.notify_merge_done,result,elapsed)
-        if DRIVE_AVAILABLE:
-            url=_drive_upload(result)
-            if url: _n(_notify.notify_upload_done,url)
-    print()
-    print("╔══════════════════════════════════════════╗")
-    if result:
-        print("║   ✅  작업 완료                           ║")
-        print(f"║   📁  {result.name:<36}║")
-    else:
-        print("║   ⚠️   작업 완료 (출력 없음)               ║")
-    print(f"║   ⏱   {mins}분 {secs}초{' '*30}║")
-    print("╚══════════════════════════════════════════╝")
-    print()
+# ════════════════════════════════════════════════════════════════
+#  진입점
+# ════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("사용법: python openclaw.py <영상파일.mkv> [--no-telegram]")
+        sys.exit(1)
+
+    process_video(sys.argv[1])

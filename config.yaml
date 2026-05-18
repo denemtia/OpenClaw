@@ -1,28 +1,35 @@
 pipeline:
   chunk_duration_sec: 3600
-  frame_interval_sec: 0.5
+  frame_interval_sec: 1.0
   skip_after_sec: 60
   clip_offset_pre: 30
   clip_total_len: 60
   max_workers: 4
+  merge_clips: false
 
 detection:
   keyword: "탈락"
-  ocr_lang: "kor+eng"
-  ocr_psm: 7
+  ocr_lang: "ko"
+  template_threshold: 0.75   # EasyOCR 감지 시 1.0 반환 → 항상 통과
+  white_threshold: 0.008     # 흰색 픽셀 최소 비율 (1차 필터)
+  hash_threshold: 8
 
 roi:
-  x_start: 0.25
-  x_end: 0.75
-  y_start: 0.55
-  y_end: 0.90
+  x_start: 0.28
+  x_end:   0.58
+  y_start: 0.62
+  y_end:   0.78
 
 ocr_preprocess:
   upscale_factor: 3
-  denoise_h: 15
+  denoise_h: 10
   use_adaptive_threshold: true
 
 thumbnails:
   enabled: true
   width: 320
   quality: 90
+
+edl:
+  enabled: true
+  frame_rate: 60

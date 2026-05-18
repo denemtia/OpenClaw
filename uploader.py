@@ -1,72 +1,63 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+uploader.py — Google Drive 업로드 모듈
+────────────────────────────────────────
+watcher.py가 내부적으로 업로드를 처리하지만,
+openclaw.py 단독 실행 시 이 모듈을 통해 Drive 업로드 가능.
+
+.env 설정:
+  DRIVE_OUTPUT_FOLDER_ID=1DGkqk2hq1mTX-1TTQs6G5NhMFmSBR-W6
+  GOOGLE_CREDENTIALS=credentials.json
+"""
+
 import os
 from pathlib import Path
-from datetime import datetime
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
-
-FOLDER_ID        = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
-CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
 
 try:
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaFileUpload
-    from google.oauth2.service_account import Credentials
-    GDRIVE_AVAILABLE = True
+    from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    GDRIVE_AVAILABLE = False
+    pass
+
+OUTPUT_FOLDER_ID = os.getenv("DRIVE_OUTPUT_FOLDER_ID", "")
+CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS", "credentials.json")
+
 
 def _get_service():
-    creds = Credentials.from_service_account_file(
-        str(CREDENTIALS_FILE),
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
+    from google.oauth2.service_account import Credentials
+    from googleapiclient.discovery import build
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds  = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
     return build("drive", "v3", credentials=creds)
 
-def _get_or_create_folder(service, name, parent_id):
-    query = (f"name='{name}' and '{parent_id}' in parents and "
-             f"mimeType='application/vnd.google-apps.folder' and trashed=false")
-    results = service.files().list(q=query, fields="files(id)").execute()
-    files   = results.get("files", [])
-    if files:
-        return files[0]["id"]
-    folder = service.files().create(
-        body={"name": name, "parents": [parent_id],
-              "mimeType": "application/vnd.google-apps.folder"},
-        fields="id"
-    ).execute()
-    return folder["id"]
 
-def upload(file_path, folder_id=""):
-    if not GDRIVE_AVAILABLE:
-        print("[UPLOAD] google-api-python-client 미설치")
-        return None
-    if not CREDENTIALS_FILE.exists():
-        print("[UPLOAD] credentials.json 없음")
-        return None
-    target_folder = folder_id or FOLDER_ID
-    if not target_folder:
-        print("[UPLOAD] GOOGLE_DRIVE_FOLDER_ID 미설정")
-        return None
-    try:
-        service      = _get_service()
-        date_str     = datetime.now().strftime("%Y-%m-%d")
-        subfolder_id = _get_or_create_folder(service, date_str, target_folder)
-        media    = MediaFileUpload(str(file_path), mimetype="video/mp4",
-                                   resumable=True, chunksize=10*1024*1024)
-        uploaded = service.files().create(
-            body={"name": Path(file_path).name, "parents": [subfolder_id]},
-            media_body=media, fields="id,webViewLink"
-        ).execute()
-        file_id  = uploaded.get("id")
-        web_link = uploaded.get("webViewLink", "")
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"}
-        ).execute()
-        print(f"[UPLOAD] 완료: {web_link}")
-        return web_link
-    except Exception as e:
-        print(f"[UPLOAD] 오류: {e}")
-        return None
+def upload_to_drive(file_path: str, folder_id: str = None) -> str:
+    """
+    단일 파일을 Drive에 업로드.
+    Returns: 업로드된 파일의 Drive ID
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    folder = folder_id or OUTPUT_FOLDER_ID
+    if not folder:
+        raise ValueError("DRIVE_OUTPUT_FOLDER_ID 미설정")
+
+    service    = _get_service()
+    path       = Path(file_path)
+    mime_types = {
+        ".mp4": "video/mp4",
+        ".csv": "text/csv",
+        ".json": "application/json",
+        ".txt": "text/plain",
+        ".jpg": "image/jpeg",
+    }
+    mime = mime_types.get(path.suffix.lower(), "application/octet-stream")
+
+    media     = MediaFileUpload(file_path, mimetype=mime,
+                                resumable=True, chunksize=32 * 1024 * 1024)
+    file_meta = {"name": path.name, "parents": [folder]}
+    result    = service.files().create(
+        body=file_meta, media_body=media, fields="id"
+    ).execute()
+
+    print(f"[uploader] ✓ {path.name} → Drive (id: {result['id']})")
+    return result["id"]

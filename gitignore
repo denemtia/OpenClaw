@@ -1,0 +1,17 @@
+# 민감한 파일
+.env
+credentials.json
+
+# 자동 생성 파일
+.processed_files.json
+.pending_selection.json
+watcher.log
+__pycache__/
+*.pyc
+venv/
+.DS_Store
+
+# 결과물 (대용량)
+input/
+output/
+*_openclaw/
