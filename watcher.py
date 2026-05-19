@@ -69,6 +69,18 @@ POLL_INTERVAL_SEC = 30     # 감시 간격 (초)
 TELEGRAM_POLL_SEC = 3      # 텔레그램 답장 확인 간격
 SELECTION_TIMEOUT = 300    # 5분 내 선택 없으면 다음 스캔까지 대기
 
+# openclaw.py 가 주기적으로 갱신하는 진행 파일
+PROGRESS_FILE = BASE_DIR / ".progress.json"
+
+# 현재 배치 진행 상황 (전역)
+_batch: dict = {
+    "total": 0,
+    "done": 0,
+    "current_file": None,
+    "current_start": None,
+    "done_files": [],
+}
+
 
 # ════════════════════════════════════════════════════════════════
 #  로거
@@ -313,7 +325,54 @@ def wait_for_selection(new_files: list) -> list:
 
 
 # ════════════════════════════════════════════════════════════════
-#  OpenClaw 실행
+#  진행상황 조회
+# ════════════════════════════════════════════════════════════════
+
+def send_progress_status():
+    """텔레그램으로 현재 배치 진행상황 전송."""
+    if _batch["total"] == 0:
+        send_telegram("📊 현재 처리 중인 작업이 없습니다")
+        return
+
+    msg  = "📊 <b>OpenClaw 진행상황</b>\n"
+    msg += "━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"✅ 완료: {_batch['done']}/{_batch['total']}개\n"
+
+    if _batch["current_file"]:
+        elapsed  = time.time() - _batch["current_start"]
+        elapsed_str = f"{int(elapsed // 60)}분 {int(elapsed % 60)}초"
+        msg += f"🔄 처리 중: <code>{_batch['current_file']}</code>\n"
+        msg += f"⏱ 경과: {elapsed_str}\n"
+
+        # openclaw.py 가 기록한 진행 파일 읽기
+        if PROGRESS_FILE.exists():
+            try:
+                with open(PROGRESS_FILE, encoding="utf-8") as f:
+                    prog = json.load(f)
+                pct   = prog.get("progress_pct", 0)
+                cur   = prog.get("current_hhmmss", "")
+                total = prog.get("total_hhmmss", "")
+                kills = prog.get("kill_count", 0)
+                msg += f"📈 스캔: {pct:.0f}%  ({cur} / {total})\n"
+                msg += f"✂️ 탈락 감지: {kills}개\n"
+            except Exception:
+                pass
+
+    done_files = _batch["done_files"]
+    if done_files:
+        show  = done_files[-3:]
+        more  = len(done_files) - len(show)
+        msg  += "📝 완료 목록:\n"
+        if more > 0:
+            msg += f"  … 외 {more}개\n"
+        for name in show:
+            msg += f"  ✓ {name}\n"
+
+    send_telegram(msg)
+
+
+# ════════════════════════════════════════════════════════════════
+#  OpenClaw 실행 (비차단 — 처리 중 텔레그램 명령 수신 가능)
 # ════════════════════════════════════════════════════════════════
 
 def run_openclaw(video_path: Path) -> bool:
@@ -323,22 +382,48 @@ def run_openclaw(video_path: Path) -> bool:
         send_telegram(f"❌ openclaw.py 없음\n{script}")
         return False
 
-    log.info(f"  🦞 OpenClaw 실행: {video_path.name}")
-    send_telegram(f"🦞 OpenClaw 분석 시작\n📁 {video_path.name}")
+    # 배치 진행 상황 업데이트
+    _batch["current_file"]  = video_path.name
+    _batch["current_start"] = time.time()
+    if PROGRESS_FILE.exists():
+        PROGRESS_FILE.unlink()
 
-    result = subprocess.run(
+    log.info(f"  🦞 OpenClaw 실행: {video_path.name}")
+    send_telegram(
+        f"🦞 OpenClaw 분석 시작\n"
+        f"📁 {video_path.name}\n"
+        f"📊 {_batch['done'] + 1}/{_batch['total']}번째"
+    )
+
+    # Popen — 비차단으로 실행해 텔레그램 명령 수신 유지
+    process = subprocess.Popen(
         [sys.executable, str(script), str(video_path)],
         cwd=str(BASE_DIR)
     )
-    ok = result.returncode == 0
+    poll_update_id = get_last_update_id()
 
-    # 결과물 경로 안내
+    while process.poll() is None:
+        time.sleep(5)
+        text, poll_update_id = get_latest_reply(poll_update_id)
+        if text:
+            cmd = text.strip()
+            if cmd in ("진행상황", "진행", "상태", "/status", "status"):
+                send_progress_status()
+            # 그 외 명령은 무시 (처리 완료 후 main 루프가 처리)
+
+    ok = process.returncode == 0
+
+    # 배치 상태 갱신
+    _batch["done"] += 1
+    _batch["current_file"]  = None
+    _batch["current_start"] = None
+
     result_dir = video_path.parent / f"{video_path.stem}_openclaw"
-
     if ok:
         clip_count = len(list(result_dir.glob("*.mp4"))) if result_dir.exists() else 0
+        _batch["done_files"].append(video_path.name)
         send_telegram(
-            f"✅ 분석 완료\n"
+            f"✅ 분석 완료  ({_batch['done']}/{_batch['total']})\n"
             f"📁 {video_path.name}\n"
             f"✂️ 탈락 클립 {clip_count}개 추출\n"
             f"📂 결과물: {result_dir}"
@@ -371,6 +456,11 @@ def scan_once(processed: set) -> set:
     if not selected:
         log.info("  선택 없음 — 건너뜀")
         return processed
+
+    # 배치 진행 초기화
+    _batch["total"]      = len(selected)
+    _batch["done"]       = 0
+    _batch["done_files"] = []
 
     # 선택된 파일 순서대로 처리
     for fi in selected:
@@ -434,6 +524,10 @@ def run_latest_file():
     )
     log.info(f"  [편집 실행] 최신 파일 처리: {latest.name}")
 
+    _batch["total"]      = 1
+    _batch["done"]       = 0
+    _batch["done_files"] = []
+
     try:
         run_openclaw(latest)
     except Exception as e:
@@ -494,13 +588,15 @@ def main():
                 log.info(f"  [텔레그램 명령] '{cmd}'")
                 if cmd in ("편집 실행", "편집실행", "/edit", "edit"):
                     run_latest_file()
+                elif cmd in ("진행상황", "진행", "/progress", "progress"):
+                    send_progress_status()
                 elif cmd in ("상태", "status", "/status"):
                     mounted = WATCH_PATH.exists()
                     send_telegram(
-                        f"📊 OpenClaw 상태\n"
+                        f"📡 OpenClaw 상태\n"
                         f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
                         f"{'연결됨' if mounted else '연결 끊김'}\n"
-                        f"📝 처리 완료 파일: {len(processed)}개"
+                        f"📝 누적 처리 파일: {len(processed)}개"
                     )
                 # 그 외 메시지는 무시 (wait_for_selection에서 처리)
 

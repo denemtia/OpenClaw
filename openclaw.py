@@ -51,6 +51,9 @@ KEYWORD             = "탈락"
 OCR_LANG            = "kor"
 OCR_CONFIG          = "--psm 6"
 
+# 진행상황 공유 파일 (watcher.py에서 읽음)
+PROGRESS_FILE = Path.home() / "Desktop" / "OpenClaw-project" / ".progress.json"
+
 
 # ════════════════════════════════════════════════════════════════
 #  타임코드 유틸
@@ -255,6 +258,21 @@ def process_video(video_path: str):
                                   cv2.THRESH_BINARY | cv2.THRESH_OTSU)
         txt = pytesseract.image_to_string(binary, lang=OCR_LANG,
                                           config=OCR_CONFIG)
+
+        # 진행률 파일 주기적 업데이트 (20 스텝마다 ≈ 10초)
+        if i % (step_frames * 20) == 0:
+            try:
+                with open(str(PROGRESS_FILE), "w", encoding="utf-8") as _pf:
+                    json.dump({
+                        "video": src.name,
+                        "progress_pct": round(i / total_frames * 100, 1) if total_frames else 0,
+                        "current_hhmmss": seconds_to_hhmmss(i / fps),
+                        "total_hhmmss": seconds_to_hhmmss(total_sec),
+                        "kill_count": kill_count,
+                        "updated_at": datetime.datetime.now().isoformat()
+                    }, _pf, ensure_ascii=False)
+            except Exception:
+                pass
 
         if KEYWORD in txt:
             kill_count += 1
