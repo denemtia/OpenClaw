@@ -233,11 +233,8 @@ def process_video(video_path: str):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     total_sec  = total_frames / fps
 
-    step_frames   = int(fps * SCAN_INTERVAL_SEC)
-    cooldown_frames = int(fps * COOLDOWN_SEC)
-
     print(f"  FPS: {fps:.2f}  |  총 길이: {seconds_to_hhmmss(total_sec)}")
-    print(f"  스캔 간격: {SCAN_INTERVAL_SEC}s  |  쿨타임: {COOLDOWN_SEC}s\n")
+    print(f"  스캔 간격: {SCAN_INTERVAL_SEC}s  |  클러스터 간격: {CLUSTER_GAP_SEC}s\n")
 
     # ── Phase 1: 처치 타임스탬프 전체 수집 ──────────────────────
     # DEDUP_SEC(3초) dedup만 적용 — 쿨타임 없이 전부 기록

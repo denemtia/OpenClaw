@@ -1,16 +1,17 @@
 """
-watcher.py — OpenClaw 로컬 네트워크 감시 데몬 v3.2
+watcher.py — OpenClaw 로컬 네트워크 감시 데몬 v3.3
 ─────────────────────────────────────────────────────────────────
-변경사항 (v3.1 → v3.2):
-  - 파일 감시 주기: 30초 → 1시간 (POLL_INTERVAL_SEC)
-  - 텔레그램 명령은 5초마다 별도 체크 (스캔과 분리)
-  - 명령어 /접두사 통일 및 추가:
-      /help   도움말
-      /list   미처리 파일 목록
-      /scan   즉시 스캔
-      /edit   최신 파일 즉시 처리
-      /status 상태 확인
-      /progress 진행상황
+변경사항 (v3.2 → v3.3):
+  - 파일 선택 형식 변경:
+      단일: 숫자만 입력 (예: 2)
+      다중: 괄호로 묶어 입력 (예: (1 3 5))
+      전체: 전체
+      건너뜀: /skip
+  - 새 명령어 추가:
+      /stop     — 현재 처리 중인 작업 즉시 중단
+      /cancel   — /stop 동의어
+      /queue    — 현재 처리 대기열 확인
+  - 도움말 메시지 개선 (선택 규칙 포함)
 
 사용법:
   python watcher.py            # 상시 실행
@@ -68,6 +69,9 @@ _batch: dict = {
     "current_start": None,
     "done_files": [],
 }
+
+# 처리 중단 플래그 (run_openclaw 루프에서 확인)
+_stop_requested = False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -193,6 +197,11 @@ def normalize_cmd(text: str) -> str:
         "스킵": "skip", "건너뛰기": "skip",
         # 전체
         "전체": "all",
+        # 중단
+        "중단": "stop", "취소": "stop", "cancel": "stop",
+        "처리중단": "stop", "처리취소": "stop",
+        # 대기열
+        "대기열": "queue", "대기": "queue",
     }
     return aliases.get(t, t)
 
@@ -211,10 +220,20 @@ def send_help():
         "  /edit       — 최신 파일 즉시 처리\n\n"
         "📊 <b>상태 확인</b>\n"
         "  /status     — 드라이브 연결 + 처리 현황\n"
-        "  /progress   — 현재 분석 진행률\n\n"
+        "  /progress   — 현재 분석 진행률\n"
+        "  /queue      — 현재 처리 대기열 확인\n\n"
+        "🛑 <b>제어</b>\n"
+        "  /stop       — 현재 처리 작업 즉시 중단\n"
+        "  /skip       — 파일 선택 건너뜀\n\n"
         "⚙️ <b>기타</b>\n"
         "  /help       — 이 도움말\n"
         "  /reset      — 처리 목록 초기화 (재처리)\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "📌 <b>파일 선택 방법</b>\n"
+        "  단일: <code>2</code>\n"
+        "  다중: <code>(1 3 5)</code>\n"
+        "  전체: <code>전체</code>\n"
+        "  건너뜀: <code>/skip</code>\n"
         "━━━━━━━━━━━━━━━━━━━\n"
         f"⏱ 자동 스캔 주기: {POLL_INTERVAL_SEC // 3600}시간"
     )
@@ -343,9 +362,11 @@ def wait_for_selection(new_files: list) -> list:
         msg += f"<b>{idx}.</b> {f['name']}\n"
         msg += f"     📅 {f['mtime']}  💾 {f['size_gb']:.1f}GB\n\n"
     msg += "━━━━━━━━━━━━━━━━━━━\n"
-    msg += "처리할 번호를 답장해주세요\n"
-    msg += "예) <code>1</code>  <code>1 3</code>  <code>전체</code>\n"
-    msg += "건너뛰려면 <code>/skip</code>"
+    msg += "📌 <b>처리할 번호를 입력해주세요</b>\n\n"
+    msg += "  단일 선택: <code>2</code>\n"
+    msg += "  다중 선택: <code>(1 3 5)</code>\n"
+    msg += "  전체 선택: <code>전체</code>\n"
+    msg += "  건너뛰기: <code>/skip</code>"
 
     send_telegram(msg)
     log.info("  텔레그램 목록 전송 완료 — 답장 대기 중...")
@@ -380,41 +401,56 @@ def wait_for_selection(new_files: list) -> list:
             send_telegram(f"✅ 전체 {len(new_files)}개 선택\n처리를 시작합니다!")
             return new_files
 
-        # 번호 파싱
-        try:
-            nums = [
-                int(x) for x in text.replace(",", " ").split()
-                if x.replace(",", "").isdigit()
-            ]
-            if not nums:
-                send_telegram("⚠️ 숫자 또는 '전체' / '/skip'으로 입력해주세요")
-                continue
+        # ── 번호 파싱 ─────────────────────────────────────────
+        stripped = text.strip()
 
-            selected, invalid = [], []
-            for n in nums:
-                if 1 <= n <= len(new_files):
-                    if new_files[n - 1] not in selected:
-                        selected.append(new_files[n - 1])
-                else:
-                    invalid.append(n)
-
-            if invalid:
-                send_telegram(
-                    f"⚠️ 없는 번호: {invalid}\n"
-                    f"1~{len(new_files)} 사이로 입력해주세요"
-                )
-                continue
-
-            if selected:
-                names = "\n".join(f"  • {f['name']}" for f in selected)
-                send_telegram(
-                    f"✅ {len(selected)}개 선택\n{names}\n\n처리를 시작합니다!"
-                )
-                return selected
-
-        except ValueError:
-            send_telegram("⚠️ 숫자 또는 '전체' / '/skip'으로 입력해주세요")
+        # 다중 선택: (1 3 5) 괄호 형식
+        if stripped.startswith("(") and stripped.endswith(")"):
+            inner = stripped[1:-1].replace(",", " ")
+            parts = inner.split()
+        # 단일 선택: 숫자 하나
+        elif stripped.isdigit():
+            parts = [stripped]
+        else:
+            send_telegram(
+                "⚠️ 형식이 맞지 않습니다\n\n"
+                "  단일: <code>2</code>\n"
+                "  다중: <code>(1 3 5)</code>\n"
+                "  전체: <code>전체</code>\n"
+                "  건너뜀: <code>/skip</code>"
+            )
             continue
+
+        try:
+            nums = [int(x) for x in parts if x.isdigit()]
+        except ValueError:
+            nums = []
+
+        if not nums:
+            send_telegram("⚠️ 올바른 번호를 입력해주세요")
+            continue
+
+        selected, invalid = [], []
+        for n in nums:
+            if 1 <= n <= len(new_files):
+                if new_files[n - 1] not in selected:
+                    selected.append(new_files[n - 1])
+            else:
+                invalid.append(n)
+
+        if invalid:
+            send_telegram(
+                f"⚠️ 없는 번호: {invalid}\n"
+                f"1~{len(new_files)} 사이로 입력해주세요"
+            )
+            continue
+
+        if selected:
+            names = "\n".join(f"  • {f['name']}" for f in selected)
+            send_telegram(
+                f"✅ {len(selected)}개 선택\n{names}\n\n처리를 시작합니다!"
+            )
+            return selected
 
     log.warning(f"  {SELECTION_TIMEOUT}초 내 답장 없음 — 다음 스캔까지 대기")
     send_telegram(
@@ -492,6 +528,9 @@ def run_openclaw(video_path: Path) -> bool:
         f"📊 {_batch['done'] + 1}/{_batch['total']}번째"
     )
 
+    global _stop_requested
+    _stop_requested = False
+
     process = subprocess.Popen(
         [sys.executable, str(script), str(video_path)],
         cwd=str(BASE_DIR)
@@ -503,7 +542,21 @@ def run_openclaw(video_path: Path) -> bool:
         text, poll_update_id = get_latest_reply(poll_update_id)
         if text:
             cmd = normalize_cmd(text)
-            if cmd == "progress":
+            if cmd == "stop":
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    process.kill()
+                _stop_requested = True
+                send_telegram(
+                    f"🛑 처리 중단됨\n"
+                    f"📁 {_batch['current_file']}\n"
+                    f"완료: {_batch['done']}/{_batch['total']}개"
+                )
+                log.info(f"  [/stop] 처리 중단: {_batch['current_file']}")
+                break
+            elif cmd == "progress":
                 send_progress_status()
             elif cmd == "status":
                 mounted = WATCH_PATH.exists()
@@ -512,6 +565,17 @@ def run_openclaw(video_path: Path) -> bool:
                     f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
                     f"{'연결됨' if mounted else '연결 끊김'}\n"
                     f"🔄 현재 처리 중: {_batch['current_file']}"
+                )
+            elif cmd == "queue":
+                done  = _batch["done"]
+                total = _batch["total"]
+                remain = total - done
+                send_telegram(
+                    f"📋 처리 대기열\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"✅ 완료: {done}개\n"
+                    f"⏳ 남은: {remain}개\n"
+                    f"🔄 현재: {_batch['current_file'] or '없음'}"
                 )
             elif cmd == "help":
                 send_help()
@@ -564,7 +628,13 @@ def scan_once(processed: set) -> set:
     _batch["done"]       = 0
     _batch["done_files"] = []
 
+    global _stop_requested
     for fi in selected:
+        if _stop_requested:
+            log.info("  [중단] 남은 파일 처리 건너뜀")
+            send_telegram("⏭ 남은 파일 처리를 건너뜁니다")
+            break
+
         video_path = fi["path_obj"]
         log.info(f"\n  처리 시작: {fi['name']}")
         try:
@@ -574,9 +644,10 @@ def scan_once(processed: set) -> set:
             send_telegram(f"❌ 처리 실패\n📁 {fi['name']}\n오류: {e}")
             continue
 
-        processed.add(fi["path"])
-        save_processed(processed)
-        log.info(f"  ✓ 완료 기록: {fi['name']}")
+        if not _stop_requested:
+            processed.add(fi["path"])
+            save_processed(processed)
+            log.info(f"  ✓ 완료 기록: {fi['name']}")
 
     return processed
 
@@ -690,6 +761,33 @@ def handle_command(cmd: str, processed: set, last_scan_time: list) -> set:
         )
         log.info("  [/reset] 처리 목록 초기화")
 
+    elif cmd == "stop":
+        if _batch["current_file"]:
+            send_telegram(
+                "⚠️ 처리 중인 작업이 있습니다\n"
+                f"🔄 {_batch['current_file']}\n"
+                "분석 중에는 /stop이 자동 적용됩니다"
+            )
+        else:
+            send_telegram("ℹ️ 현재 처리 중인 작업이 없습니다")
+
+    elif cmd == "queue":
+        done  = _batch["done"]
+        total = _batch["total"]
+        if total == 0:
+            send_telegram("ℹ️ 현재 처리 대기열이 없습니다")
+        else:
+            remain = total - done
+            done_list = "\n".join(f"  ✓ {n}" for n in _batch["done_files"]) or "  없음"
+            send_telegram(
+                f"📋 <b>처리 대기열</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ 완료: {done}개\n"
+                f"⏳ 남은: {remain}개\n"
+                f"🔄 현재: {_batch['current_file'] or '없음'}\n"
+                f"📝 완료 목록:\n{done_list}"
+            )
+
     return processed
 
 
@@ -698,7 +796,7 @@ def handle_command(cmd: str, processed: set, last_scan_time: list) -> set:
 # ════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="OpenClaw Watcher v3.2")
+    parser = argparse.ArgumentParser(description="OpenClaw Watcher v3.3")
     parser.add_argument("--once",  action="store_true", help="1회 스캔 후 종료")
     parser.add_argument("--poll",  type=int, default=POLL_INTERVAL_SEC,
                         help=f"폴링 간격(초) [기본: {POLL_INTERVAL_SEC}]")
@@ -707,7 +805,7 @@ def main():
     args = parser.parse_args()
 
     log.info("═" * 48)
-    log.info("  OpenClaw Watcher v3.2 시작")
+    log.info("  OpenClaw Watcher v3.3 시작")
     log.info(f"  감시 경로  : {WATCH_PATH}")
     log.info(f"  결과물 경로: {OUTPUT_DIR}")
     log.info(f"  폴링 간격  : {args.poll}초 ({args.poll // 3600}시간 {(args.poll % 3600) // 60}분)")
@@ -725,7 +823,7 @@ def main():
     log.info(f"  기처리 파일: {len(processed)}개\n")
 
     send_telegram(
-        f"🦞 <b>OpenClaw Watcher v3.2 시작!</b>\n"
+        f"🦞 <b>OpenClaw Watcher v3.3 시작!</b>\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📂 감시: {WATCH_PATH.name}\n"
         f"⏱ 스캔 주기: {args.poll // 3600}시간\n"
