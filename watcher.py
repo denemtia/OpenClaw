@@ -1,31 +1,21 @@
 """
-watcher.py — OpenClaw 로컬 네트워크 감시 데몬 v3.0
+watcher.py — OpenClaw 로컬 네트워크 감시 데몬 v3.2
 ─────────────────────────────────────────────────────────────────
-변경사항 (v2 → v3):
-  - Google Drive 완전 제거
-  - /Volumes/영상 녹화2/ 로컬 네트워크 경로 직접 감시
-  - 새 파일(최신순) 우선 처리
-  - 텔레그램 선택 방식 유지
-  - 결과물은 맥미니 로컬에 저장 + 텔레그램 알림
-
-흐름:
-  [/Volumes/영상 녹화2/ 새 .mkv 감지 (최신순)]
-       ↓
-  [텔레그램으로 목록 전송]
-    🎬 새 영상 3개 발견!
-    1. 2026-05-15 21-32-54.mkv (8.5GB) ← 최신
-    2. 2026-05-14 22-57-28.mkv (8.5GB)
-    3. 2026-05-13 01-32-08.mkv (8.5GB)
-    처리할 번호를 답장해주세요 (예: 1 3 또는 전체)
-       ↓
-  [사용자 답장]
-       ↓
-  [openclaw.py 실행 → 결과물 로컬 저장 → 텔레그램 알림]
+변경사항 (v3.1 → v3.2):
+  - 파일 감시 주기: 30초 → 1시간 (POLL_INTERVAL_SEC)
+  - 텔레그램 명령은 5초마다 별도 체크 (스캔과 분리)
+  - 명령어 /접두사 통일 및 추가:
+      /help   도움말
+      /list   미처리 파일 목록
+      /scan   즉시 스캔
+      /edit   최신 파일 즉시 처리
+      /status 상태 확인
+      /progress 진행상황
 
 사용법:
   python watcher.py            # 상시 실행
   python watcher.py --once     # 1회 스캔 (테스트)
-  python watcher.py --poll 30  # 폴링 간격 30초
+  python watcher.py --poll N   # 폴링 간격 N초
 """
 
 import os
@@ -56,23 +46,21 @@ except ImportError:
 # ════════════════════════════════════════════════════════════════
 
 BASE_DIR      = Path.home() / "Desktop" / "OpenClaw-project"
-OUTPUT_DIR    = BASE_DIR / "output"       # 결과물 저장 경로
+OUTPUT_DIR    = BASE_DIR / "output"
 PROCESSED_LOG = BASE_DIR / ".processed_files.json"
 
-# 감시할 네트워크 경로 (송출PC 공유 폴더)
 WATCH_PATH = Path("/Volumes/영상 녹화2")
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", os.getenv("TELEGRAM_TOKEN", ""))
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-POLL_INTERVAL_SEC = 30     # 감시 간격 (초)
-TELEGRAM_POLL_SEC = 3      # 텔레그램 답장 확인 간격
-SELECTION_TIMEOUT = 300    # 5분 내 선택 없으면 다음 스캔까지 대기
+POLL_INTERVAL_SEC  = 3600   # 파일 감시 주기: 1시간
+CMD_POLL_SEC       = 5      # 텔레그램 명령 체크 주기: 5초
+TELEGRAM_POLL_SEC  = 3      # 선택 대기 중 답장 확인 주기
+SELECTION_TIMEOUT  = 300    # 파일 선택 대기 시간: 5분
 
-# openclaw.py 가 주기적으로 갱신하는 진행 파일
 PROGRESS_FILE = BASE_DIR / ".progress.json"
 
-# 현재 배치 진행 상황 (전역)
 _batch: dict = {
     "total": 0,
     "done": 0,
@@ -176,14 +164,134 @@ def get_latest_reply(after_update_id: int) -> tuple:
 
 
 # ════════════════════════════════════════════════════════════════
+#  명령어 정규화
+#  "/Status", "STATUS", "상태" 등 모두 통일된 키로 변환
+# ════════════════════════════════════════════════════════════════
+
+def normalize_cmd(text: str) -> str:
+    """
+    '/도움말', '도움말', '/help', 'HELP' → 'help' 형태로 정규화.
+    / 접두사 제거 후 소문자 변환. 한국어 별칭 매핑.
+    """
+    t = text.strip().lstrip("/").lower()
+    aliases = {
+        # 도움말
+        "도움말": "help", "명령어": "help",
+        # 상태
+        "상태": "status", "상태확인": "status",
+        # 진행상황
+        "진행상황": "progress", "진행": "progress",
+        # 편집 실행
+        "편집실행": "edit", "편집 실행": "edit",
+        # 파일 목록
+        "파일목록": "list", "목록": "list", "새파일": "list",
+        # 즉시 스캔
+        "스캔": "scan", "즉시스캔": "scan",
+        # 초기화
+        "초기화": "reset",
+        # 스킵
+        "스킵": "skip", "건너뛰기": "skip",
+        # 전체
+        "전체": "all",
+    }
+    return aliases.get(t, t)
+
+
+# ════════════════════════════════════════════════════════════════
+#  명령어: 도움말
+# ════════════════════════════════════════════════════════════════
+
+def send_help():
+    msg = (
+        "🦞 <b>OpenClaw 명령어 목록</b>\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "📋 <b>파일 관리</b>\n"
+        "  /list       — 미처리 파일 목록 보기\n"
+        "  /scan       — 지금 즉시 폴더 스캔\n"
+        "  /edit       — 최신 파일 즉시 처리\n\n"
+        "📊 <b>상태 확인</b>\n"
+        "  /status     — 드라이브 연결 + 처리 현황\n"
+        "  /progress   — 현재 분석 진행률\n\n"
+        "⚙️ <b>기타</b>\n"
+        "  /help       — 이 도움말\n"
+        "  /reset      — 처리 목록 초기화 (재처리)\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ 자동 스캔 주기: {POLL_INTERVAL_SEC // 3600}시간"
+    )
+    send_telegram(msg)
+
+
+# ════════════════════════════════════════════════════════════════
+#  명령어: 파일 목록
+# ════════════════════════════════════════════════════════════════
+
+def send_file_list(processed: set):
+    try:
+        exists = WATCH_PATH.exists()
+    except OSError as e:
+        send_telegram(f"⚠️ 드라이브 접근 오류\n📂 {WATCH_PATH}\n{e}")
+        return
+    if not exists:
+        send_telegram(
+            f"⚠️ 네트워크 드라이브 연결 끊김\n📂 {WATCH_PATH}"
+        )
+        return
+
+    try:
+        all_mkv = sorted(
+            WATCH_PATH.glob("*.mkv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+    except OSError as e:
+        send_telegram(f"⚠️ 드라이브 스캔 오류\n{e}")
+        return
+
+    new_files = [p for p in all_mkv if str(p) not in processed]
+    done_files = [p for p in all_mkv if str(p) in processed]
+
+    if not all_mkv:
+        send_telegram("📂 감시 경로에 .mkv 파일이 없습니다")
+        return
+
+    msg = f"📂 <b>영상 파일 현황</b>\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━\n"
+
+    if new_files:
+        msg += f"🆕 <b>미처리 {len(new_files)}개</b>\n"
+        for i, p in enumerate(new_files[:10], 1):
+            size_gb = p.stat().st_size / (1024 ** 3)
+            mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%m/%d %H:%M")
+            msg += f"  {i}. {p.name}\n"
+            msg += f"     📅 {mtime}  💾 {size_gb:.1f}GB\n"
+        if len(new_files) > 10:
+            msg += f"  … 외 {len(new_files) - 10}개\n"
+    else:
+        msg += "✅ 미처리 파일 없음\n"
+
+    msg += f"\n✅ 완료: {len(done_files)}개\n"
+    msg += "━━━━━━━━━━━━━━━━━━━\n"
+    msg += "처리하려면 <code>/edit</code> 또는 <code>/scan</code>"
+    send_telegram(msg)
+
+
+# ════════════════════════════════════════════════════════════════
 #  네트워크 경로 감시
 # ════════════════════════════════════════════════════════════════
 
 def check_mount() -> bool:
-    """네트워크 드라이브 마운트 상태 확인"""
-    if not WATCH_PATH.exists():
+    try:
+        exists = WATCH_PATH.exists()
+    except OSError as e:
+        log.warning(f"  드라이브 접근 오류 (Errno {e.errno}): {e}")
+        send_telegram(
+            f"⚠️ 네트워크 드라이브 접근 오류\n"
+            f"📂 {WATCH_PATH}\n"
+            f"Finder에서 다시 연결해주세요"
+        )
+        return False
+    if not exists:
         log.warning(f"  경로 없음: {WATCH_PATH}")
-        log.warning("  Finder → 네트워크 → 172.30.1.22 → 영상 녹화2 마운트 확인")
         send_telegram(
             f"⚠️ 네트워크 드라이브 연결 끊김\n"
             f"📂 {WATCH_PATH}\n"
@@ -193,18 +301,19 @@ def check_mount() -> bool:
     return True
 
 def scan_new_files(processed: set) -> list:
-    """
-    감시 경로에서 새 .mkv 파일 목록 반환.
-    최신 파일(수정 시간 기준) 우선 정렬.
-    """
     if not check_mount():
         return []
 
-    all_mkv = sorted(
-        WATCH_PATH.glob("*.mkv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True   # 최신 파일 먼저
-    )
+    try:
+        all_mkv = sorted(
+            WATCH_PATH.glob("*.mkv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+    except OSError as e:
+        log.warning(f"  드라이브 스캔 오류: {e}")
+        send_telegram(f"⚠️ 드라이브 스캔 중 오류 발생\n{e}")
+        return []
 
     new_files = []
     for p in all_mkv:
@@ -228,10 +337,6 @@ def scan_new_files(processed: set) -> list:
 # ════════════════════════════════════════════════════════════════
 
 def wait_for_selection(new_files: list) -> list:
-    """
-    텔레그램으로 파일 목록 전송 후 사용자 답장 대기.
-    Returns: 선택된 파일 info 리스트
-    """
     msg  = f"🎬 <b>새 영상 {len(new_files)}개 발견!</b>\n"
     msg += f"<i>(최신 순 정렬)</i>\n\n"
     for idx, f in enumerate(new_files, 1):
@@ -240,7 +345,7 @@ def wait_for_selection(new_files: list) -> list:
     msg += "━━━━━━━━━━━━━━━━━━━\n"
     msg += "처리할 번호를 답장해주세요\n"
     msg += "예) <code>1</code>  <code>1 3</code>  <code>전체</code>\n"
-    msg += "건너뛰려면 <code>스킵</code>"
+    msg += "건너뛰려면 <code>/skip</code>"
 
     send_telegram(msg)
     log.info("  텔레그램 목록 전송 완료 — 답장 대기 중...")
@@ -255,26 +360,23 @@ def wait_for_selection(new_files: list) -> list:
         text, new_update_id = get_latest_reply(base_update_id)
 
         if text is None or new_update_id == base_update_id:
-            # 남은 시간 중간 알림 (2분 경과 시)
             if elapsed == 120:
                 send_telegram(
                     f"⏳ 아직 선택 대기 중...\n"
-                    f"번호 또는 '전체' / '스킵'으로 답장해주세요\n"
+                    f"번호 또는 '전체' / '/skip'으로 답장해주세요\n"
                     f"({(SELECTION_TIMEOUT - elapsed) // 60}분 후 자동 종료)"
                 )
             continue
 
         base_update_id = new_update_id
-        text = text.strip()
-        log.info(f"  답장 수신: '{text}'")
+        cmd = normalize_cmd(text)
+        log.info(f"  답장 수신: '{text}' → '{cmd}'")
 
-        # 스킵
-        if text.lower() in ("스킵", "skip", "건너뛰기"):
+        if cmd == "skip":
             send_telegram("⏭ 스킵했습니다.\n다음 스캔 때 다시 알림드릴게요.")
             return []
 
-        # 전체 선택
-        if text.lower() in ("전체", "all", "0"):
+        if cmd in ("all", "전체"):
             send_telegram(f"✅ 전체 {len(new_files)}개 선택\n처리를 시작합니다!")
             return new_files
 
@@ -285,13 +387,12 @@ def wait_for_selection(new_files: list) -> list:
                 if x.replace(",", "").isdigit()
             ]
             if not nums:
-                send_telegram("⚠️ 숫자 또는 '전체' / '스킵'으로 입력해주세요")
+                send_telegram("⚠️ 숫자 또는 '전체' / '/skip'으로 입력해주세요")
                 continue
 
             selected, invalid = [], []
             for n in nums:
                 if 1 <= n <= len(new_files):
-                    # 중복 선택 방지
                     if new_files[n - 1] not in selected:
                         selected.append(new_files[n - 1])
                 else:
@@ -312,10 +413,9 @@ def wait_for_selection(new_files: list) -> list:
                 return selected
 
         except ValueError:
-            send_telegram("⚠️ 숫자 또는 '전체' / '스킵'으로 입력해주세요")
+            send_telegram("⚠️ 숫자 또는 '전체' / '/skip'으로 입력해주세요")
             continue
 
-    # 타임아웃
     log.warning(f"  {SELECTION_TIMEOUT}초 내 답장 없음 — 다음 스캔까지 대기")
     send_telegram(
         f"⏰ {SELECTION_TIMEOUT // 60}분 내 선택이 없어 대기를 종료합니다\n"
@@ -329,7 +429,6 @@ def wait_for_selection(new_files: list) -> list:
 # ════════════════════════════════════════════════════════════════
 
 def send_progress_status():
-    """텔레그램으로 현재 배치 진행상황 전송."""
     if _batch["total"] == 0:
         send_telegram("📊 현재 처리 중인 작업이 없습니다")
         return
@@ -344,7 +443,6 @@ def send_progress_status():
         msg += f"🔄 처리 중: <code>{_batch['current_file']}</code>\n"
         msg += f"⏱ 경과: {elapsed_str}\n"
 
-        # openclaw.py 가 기록한 진행 파일 읽기
         if PROGRESS_FILE.exists():
             try:
                 with open(PROGRESS_FILE, encoding="utf-8") as f:
@@ -372,7 +470,7 @@ def send_progress_status():
 
 
 # ════════════════════════════════════════════════════════════════
-#  OpenClaw 실행 (비차단 — 처리 중 텔레그램 명령 수신 가능)
+#  OpenClaw 실행 (비차단)
 # ════════════════════════════════════════════════════════════════
 
 def run_openclaw(video_path: Path) -> bool:
@@ -382,7 +480,6 @@ def run_openclaw(video_path: Path) -> bool:
         send_telegram(f"❌ openclaw.py 없음\n{script}")
         return False
 
-    # 배치 진행 상황 업데이트
     _batch["current_file"]  = video_path.name
     _batch["current_start"] = time.time()
     if PROGRESS_FILE.exists():
@@ -395,7 +492,6 @@ def run_openclaw(video_path: Path) -> bool:
         f"📊 {_batch['done'] + 1}/{_batch['total']}번째"
     )
 
-    # Popen — 비차단으로 실행해 텔레그램 명령 수신 유지
     process = subprocess.Popen(
         [sys.executable, str(script), str(video_path)],
         cwd=str(BASE_DIR)
@@ -406,14 +502,22 @@ def run_openclaw(video_path: Path) -> bool:
         time.sleep(5)
         text, poll_update_id = get_latest_reply(poll_update_id)
         if text:
-            cmd = text.strip()
-            if cmd in ("진행상황", "진행", "상태", "/status", "status"):
+            cmd = normalize_cmd(text)
+            if cmd == "progress":
                 send_progress_status()
-            # 그 외 명령은 무시 (처리 완료 후 main 루프가 처리)
+            elif cmd == "status":
+                mounted = WATCH_PATH.exists()
+                send_telegram(
+                    f"📡 OpenClaw 상태\n"
+                    f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
+                    f"{'연결됨' if mounted else '연결 끊김'}\n"
+                    f"🔄 현재 처리 중: {_batch['current_file']}"
+                )
+            elif cmd == "help":
+                send_help()
 
     ok = process.returncode == 0
 
-    # 배치 상태 갱신
     _batch["done"] += 1
     _batch["current_file"]  = None
     _batch["current_start"] = None
@@ -450,31 +554,26 @@ def scan_once(processed: set) -> set:
     for f in new_files:
         log.info(f"  → {f['name']}  ({f['size_gb']:.1f}GB)  {f['mtime']}")
 
-    # 텔레그램으로 선택 요청
     selected = wait_for_selection(new_files)
 
     if not selected:
         log.info("  선택 없음 — 건너뜀")
         return processed
 
-    # 배치 진행 초기화
     _batch["total"]      = len(selected)
     _batch["done"]       = 0
     _batch["done_files"] = []
 
-    # 선택된 파일 순서대로 처리
     for fi in selected:
         video_path = fi["path_obj"]
         log.info(f"\n  처리 시작: {fi['name']}")
         try:
-            ok = run_openclaw(video_path)
+            run_openclaw(video_path)
         except Exception as e:
             log.error(f"  ✗ 실패: {fi['name']} — {e}")
             send_telegram(f"❌ 처리 실패\n📁 {fi['name']}\n오류: {e}")
             continue
 
-        # 성공/실패 무관하게 processed에 추가 (재처리 방지)
-        # 재처리 원하면 .processed_files.json 에서 해당 경로 삭제
         processed.add(fi["path"])
         save_processed(processed)
         log.info(f"  ✓ 완료 기록: {fi['name']}")
@@ -483,19 +582,20 @@ def scan_once(processed: set) -> set:
 
 
 # ════════════════════════════════════════════════════════════════
-#  메인
-# ════════════════════════════════════════════════════════════════
-
-# ════════════════════════════════════════════════════════════════
-#  "편집 실행" 명령 처리 — 최신 파일 즉시 처리
+#  편집 실행 — 최신 파일 즉시 처리
 # ════════════════════════════════════════════════════════════════
 
 def run_latest_file():
-    """
-    텔레그램에서 '편집 실행' 수신 시:
-    /Volumes/영상 녹화2/ 에서 가장 최근 .mkv 파일을 즉시 처리.
-    """
-    if not WATCH_PATH.exists():
+    try:
+        exists = WATCH_PATH.exists()
+    except OSError as e:
+        send_telegram(
+            f"⚠️ 드라이브 접근 오류\n"
+            f"📂 {WATCH_PATH}\n"
+            f"Finder에서 다시 연결해주세요"
+        )
+        return
+    if not exists:
         send_telegram(
             f"⚠️ 네트워크 드라이브 연결 끊김\n"
             f"📂 {WATCH_PATH}\n"
@@ -503,26 +603,30 @@ def run_latest_file():
         )
         return
 
-    all_mkv = sorted(
-        WATCH_PATH.glob("*.mkv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True
-    )
+    try:
+        all_mkv = sorted(
+            WATCH_PATH.glob("*.mkv"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+    except OSError as e:
+        send_telegram(f"⚠️ 드라이브 스캔 오류\n{e}")
+        return
 
     if not all_mkv:
         send_telegram("⚠️ 감시 경로에 .mkv 파일이 없습니다")
         return
 
-    latest = all_mkv[0]
+    latest  = all_mkv[0]
     size_gb = latest.stat().st_size / (1024 ** 3)
-    mtime = datetime.fromtimestamp(latest.stat().st_mtime).strftime("%m/%d %H:%M")
+    mtime   = datetime.fromtimestamp(latest.stat().st_mtime).strftime("%m/%d %H:%M")
 
     send_telegram(
         f"▶️ 편집 실행 — 최신 파일 처리 시작\n"
         f"📁 {latest.name}\n"
         f"📅 {mtime}  💾 {size_gb:.1f}GB"
     )
-    log.info(f"  [편집 실행] 최신 파일 처리: {latest.name}")
+    log.info(f"  [/edit] 최신 파일 처리: {latest.name}")
 
     _batch["total"]      = 1
     _batch["done"]       = 0
@@ -535,75 +639,130 @@ def run_latest_file():
         send_telegram(f"❌ 편집 실행 실패\n오류: {e}")
 
 
+# ════════════════════════════════════════════════════════════════
+#  명령어 처리 (메인 루프에서 호출)
+# ════════════════════════════════════════════════════════════════
+
+def handle_command(cmd: str, processed: set, last_scan_time: list) -> set:
+    """
+    정규화된 명령어 처리.
+    last_scan_time: [float] 리스트 (mutable reference)
+    """
+    if cmd == "help":
+        send_help()
+
+    elif cmd == "status":
+        mounted = WATCH_PATH.exists()
+        processed_now = load_processed()
+        send_telegram(
+            f"📡 <b>OpenClaw 상태</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
+            f"{'연결됨' if mounted else '연결 끊김'}\n"
+            f"📝 누적 처리 파일: {len(processed_now)}개\n"
+            f"⏱ 다음 자동 스캔: "
+            f"{max(0, int((last_scan_time[0] + POLL_INTERVAL_SEC - time.time()) / 60))}분 후"
+        )
+
+    elif cmd == "progress":
+        send_progress_status()
+
+    elif cmd == "edit":
+        run_latest_file()
+
+    elif cmd == "list":
+        send_file_list(processed)
+
+    elif cmd == "scan":
+        log.info("  [/scan] 즉시 스캔 시작")
+        send_telegram("🔍 즉시 스캔을 시작합니다...")
+        processed = scan_once(processed)
+        last_scan_time[0] = time.time()
+        save_processed(processed)
+
+    elif cmd == "reset":
+        if PROCESSED_LOG.exists():
+            PROCESSED_LOG.unlink()
+        processed = set()
+        send_telegram(
+            "🔄 처리 목록을 초기화했습니다.\n"
+            "다음 스캔 시 모든 파일을 새 파일로 감지합니다."
+        )
+        log.info("  [/reset] 처리 목록 초기화")
+
+    return processed
+
+
+# ════════════════════════════════════════════════════════════════
+#  메인
+# ════════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="OpenClaw Watcher v3")
+    parser = argparse.ArgumentParser(description="OpenClaw Watcher v3.2")
     parser.add_argument("--once",  action="store_true", help="1회 스캔 후 종료")
     parser.add_argument("--poll",  type=int, default=POLL_INTERVAL_SEC,
                         help=f"폴링 간격(초) [기본: {POLL_INTERVAL_SEC}]")
     parser.add_argument("--reset", action="store_true",
-                        help="처리 완료 목록 초기화 (전체 재처리)")
+                        help="처리 완료 목록 초기화")
     args = parser.parse_args()
 
     log.info("═" * 48)
-    log.info("  OpenClaw Watcher v3.1 시작")
+    log.info("  OpenClaw Watcher v3.2 시작")
     log.info(f"  감시 경로  : {WATCH_PATH}")
     log.info(f"  결과물 경로: {OUTPUT_DIR}")
-    log.info(f"  폴링 간격  : {args.poll}초")
+    log.info(f"  폴링 간격  : {args.poll}초 ({args.poll // 3600}시간 {(args.poll % 3600) // 60}분)")
     log.info("═" * 48)
 
-    # 처리 목록 초기화
     if args.reset:
         if PROCESSED_LOG.exists():
             PROCESSED_LOG.unlink()
         log.info("  처리 완료 목록 초기화됨\n")
 
-    # 네트워크 경로 확인 (--once 제외)
     if not args.once and not WATCH_PATH.exists():
-        log.warning(f"  감시 경로 없음 (나중에 마운트 시 자동 재시도): {WATCH_PATH}")
+        log.warning(f"  감시 경로 없음 (마운트 시 자동 재시도): {WATCH_PATH}")
 
     processed = load_processed()
     log.info(f"  기처리 파일: {len(processed)}개\n")
 
     send_telegram(
-        f"🦞 OpenClaw Watcher v3.1 시작!\n"
-        f"📂 감시 중: {WATCH_PATH.name}\n"
-        f"⏱ 스캔 간격: {args.poll}초\n"
-        f"💬 '편집 실행' 전송 시 최신 파일 즉시 처리"
+        f"🦞 <b>OpenClaw Watcher v3.2 시작!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 감시: {WATCH_PATH.name}\n"
+        f"⏱ 스캔 주기: {args.poll // 3600}시간\n"
+        f"💬 /help 으로 명령어 목록 확인"
     )
 
+    # ── 1회 실행 모드 ─────────────────────────────────────────
     if args.once:
         scan_once(processed)
         log.info("  [--once] 완료")
         return
 
+    # ── 상시 실행 모드 ────────────────────────────────────────
     # 텔레그램 update_id 초기화 (기존 메시지 무시)
     last_update_id = get_last_update_id()
 
+    # last_scan_time[0] = 0 → 시작 직후 즉시 1회 스캔
+    last_scan_time = [0.0]
+
     try:
         while True:
-            # ── 텔레그램 명령 확인 ──────────────────────────────
+            # ── 텔레그램 명령 체크 (CMD_POLL_SEC마다) ───────────
             text, last_update_id = get_latest_reply(last_update_id)
             if text:
-                cmd = text.strip()
-                log.info(f"  [텔레그램 명령] '{cmd}'")
-                if cmd in ("편집 실행", "편집실행", "/edit", "edit"):
-                    run_latest_file()
-                elif cmd in ("진행상황", "진행", "/progress", "progress"):
-                    send_progress_status()
-                elif cmd in ("상태", "status", "/status"):
-                    mounted = WATCH_PATH.exists()
-                    send_telegram(
-                        f"📡 OpenClaw 상태\n"
-                        f"{'✅' if mounted else '❌'} 네트워크 드라이브: "
-                        f"{'연결됨' if mounted else '연결 끊김'}\n"
-                        f"📝 누적 처리 파일: {len(processed)}개"
-                    )
-                # 그 외 메시지는 무시 (wait_for_selection에서 처리)
+                cmd = normalize_cmd(text)
+                log.info(f"  [텔레그램 명령] '{text}' → '{cmd}'")
+                processed = handle_command(cmd, processed, last_scan_time)
 
-            # ── 정기 스캔 ────────────────────────────────────────
-            processed = scan_once(processed)
-            log.info(f"  {args.poll}초 대기...\n")
-            time.sleep(args.poll)
+            # ── 정기 파일 스캔 (POLL_INTERVAL_SEC마다) ──────────
+            now = time.time()
+            if now - last_scan_time[0] >= args.poll:
+                processed = scan_once(processed)
+                last_scan_time[0] = time.time()
+                next_min = args.poll // 60
+                log.info(f"  다음 스캔까지 {next_min}분 대기...\n")
+
+            time.sleep(CMD_POLL_SEC)
 
     except KeyboardInterrupt:
         log.info("\n  watcher 종료")
