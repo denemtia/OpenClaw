@@ -1,11 +1,12 @@
 """
-OpenClaw v5.1.0
+OpenClaw v5.2.0
 ─────────────────────────────────────────
-변경사항 (v5.0.0 → v5.1.0):
-  - 감지된 탈락 장면을 개별 클립으로 분리 저장
-  - 각 클립에 원본 타임코드 기록 (CSV + JSON)
-  - 프리미어 프로용 EDL 간소화 버전 포함
-  - 결과물 폴더 자동 정리 구조
+변경사항 (v5.1.0 → v5.2.0):
+  - 클립 추출 방식 개선: 클러스터 기반으로 변경
+    · 이전: 처치 감지 → 즉시 60초 클립 (30s 전후 고정)
+    · 이제: 처치들을 전부 수집 → 60초 이내 연속 처치를 하나의 클러스터로 묶음
+            클립 = 첫 처치 - 30초 ~ 마지막 처치 + 30초 (가변 길이)
+  - 중복 감지 방지: 동일 화면 재감지 3초 dedup
 
 사용법:
   python openclaw.py <영상파일.mkv>
@@ -43,9 +44,10 @@ ROI_Y1_RATIO = 0.62
 ROI_Y2_RATIO = 0.78
 
 SCAN_INTERVAL_SEC   = 0.5   # 0.5초 간격 스캔
-COOLDOWN_SEC        = 60    # 감지 후 60초 쿨타임
-CLIP_BEFORE_SEC     = 30    # 탈락 장면 앞 30초
-CLIP_AFTER_SEC      = 30    # 탈락 장면 뒤 30초
+DEDUP_SEC           = 3     # 동일 화면 재감지 방지 (중복 제거)
+CLUSTER_GAP_SEC     = 60    # 처치 간격이 이 값 이상이면 별도 클러스터
+CLIP_BEFORE_SEC     = 30    # 첫 처치 기준 앞 30초
+CLIP_AFTER_SEC      = 30    # 마지막 처치 기준 뒤 30초
 
 KEYWORD             = "탈락"
 OCR_LANG            = "kor"
@@ -237,9 +239,15 @@ def process_video(video_path: str):
     print(f"  FPS: {fps:.2f}  |  총 길이: {seconds_to_hhmmss(total_sec)}")
     print(f"  스캔 간격: {SCAN_INTERVAL_SEC}s  |  쿨타임: {COOLDOWN_SEC}s\n")
 
-    detections = []
-    kill_count = 0
+    # ── Phase 1: 처치 타임스탬프 전체 수집 ──────────────────────
+    # DEDUP_SEC(3초) dedup만 적용 — 쿨타임 없이 전부 기록
+    raw_kills = []   # [(detect_sec, frame_copy), ...]
+    raw_count = 0
     i = 0
+    dedup_frames  = int(fps * DEDUP_SEC)
+    step_frames   = int(fps * SCAN_INTERVAL_SEC)
+
+    print("  [1/2] 탈락 장면 스캔 중...\n")
 
     while i < total_frames:
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
@@ -268,51 +276,89 @@ def process_video(video_path: str):
                         "progress_pct": round(i / total_frames * 100, 1) if total_frames else 0,
                         "current_hhmmss": seconds_to_hhmmss(i / fps),
                         "total_hhmmss": seconds_to_hhmmss(total_sec),
-                        "kill_count": kill_count,
+                        "kill_count": raw_count,
                         "updated_at": datetime.datetime.now().isoformat()
                     }, _pf, ensure_ascii=False)
             except Exception:
                 pass
 
         if KEYWORD in txt:
-            kill_count += 1
-            detect_sec  = i / fps
-            clip_start  = max(0.0, detect_sec - CLIP_BEFORE_SEC)
-            clip_end    = min(total_sec, detect_sec + CLIP_AFTER_SEC)
-            clip_name   = f"{src.stem}_kill_{kill_count:02d}.mp4"
-            clip_path   = out_dir / clip_name
-            thumb_name  = save_thumbnail(frame, out_dir, kill_count)
-
-            print(f"  ✂  탈락 #{kill_count:02d}  감지: {seconds_to_hhmmss(detect_sec)}"
+            raw_count += 1
+            detect_sec = i / fps
+            raw_kills.append((detect_sec, frame.copy()))
+            print(f"    감지 #{raw_count:02d}: {seconds_to_hhmmss(detect_sec)}"
                   f"  ({seconds_to_timecode(detect_sec)})")
-            print(f"       클립 구간: {seconds_to_hhmmss(clip_start)} ~ "
-                  f"{seconds_to_hhmmss(clip_end)}")
-            print(f"       추출 중... ", end="", flush=True)
-
-            ok = extract_clip(str(src), clip_start, clip_end, str(clip_path))
-            print("완료 ✓" if ok else "실패 ✗")
-
-            detection = {
-                "index":      kill_count,
-                "detect_sec": round(detect_sec, 2),
-                "clip_start": round(clip_start, 2),
-                "clip_end":   round(clip_end, 2),
-                "clip_file":  clip_name,
-                "thumb_file": thumb_name,
-            }
-            detections.append(detection)
-
-            # 탈락 감지마다 알람 없음 — 분석 완료 시 watcher.py에서 일괄 전송
-
-            i += cooldown_frames  # 쿨타임 적용
+            i += dedup_frames   # 동일 화면 재감지 방지 (3초)
         else:
             i += step_frames
 
     cap.release()
 
+    # ── Phase 2: 클러스터 묶기 ───────────────────────────────────
+    # 처치 간격이 CLUSTER_GAP_SEC(60초) 미만이면 같은 클러스터
+    clusters = []   # [[(sec, frame), ...], ...]
+    if raw_kills:
+        current = [raw_kills[0]]
+        for j in range(1, len(raw_kills)):
+            prev_sec = current[-1][0]
+            curr_sec = raw_kills[j][0]
+            if curr_sec - prev_sec < CLUSTER_GAP_SEC:
+                current.append(raw_kills[j])   # 같은 클러스터
+            else:
+                clusters.append(current)        # 새 클러스터 시작
+                current = [raw_kills[j]]
+        clusters.append(current)
+
+    print(f"\n  → 감지된 처치: {raw_count}건  |  클러스터: {len(clusters)}개\n")
+
+    # ── Phase 3: 클러스터당 클립 1개 추출 ────────────────────────
+    # 클립 = 클러스터 첫 처치 - 30초  ~  마지막 처치 + 30초
+    detections = []
+    kill_count = 0
+
+    print("  [2/2] 클립 추출 중...\n")
+
+    for cluster in clusters:
+        kill_count += 1
+        first_sec  = cluster[0][0]
+        last_sec   = cluster[-1][0]
+        thumb_frame = cluster[0][1]    # 첫 처치 프레임을 썸네일로
+
+        clip_start = max(0.0, first_sec - CLIP_BEFORE_SEC)
+        clip_end   = min(total_sec, last_sec  + CLIP_AFTER_SEC)
+        clip_dur   = clip_end - clip_start
+
+        clip_name  = f"{src.stem}_kill_{kill_count:02d}.mp4"
+        clip_path  = out_dir / clip_name
+        thumb_name = save_thumbnail(thumb_frame, out_dir, kill_count)
+
+        kills_in_cluster = len(cluster)
+        print(f"  ✂  클러스터 #{kill_count:02d}  "
+              f"처치 {kills_in_cluster}건  "
+              f"({seconds_to_hhmmss(first_sec)} ~ {seconds_to_hhmmss(last_sec)})")
+        print(f"       클립 구간: {seconds_to_hhmmss(clip_start)} ~ "
+              f"{seconds_to_hhmmss(clip_end)}  ({clip_dur:.0f}초)")
+        print(f"       추출 중... ", end="", flush=True)
+
+        ok = extract_clip(str(src), clip_start, clip_end, str(clip_path))
+        print("완료 ✓" if ok else "실패 ✗")
+
+        detection = {
+            "index":            kill_count,
+            "kills_in_cluster": kills_in_cluster,
+            "detect_sec":       round(first_sec, 2),   # 호환성: 첫 처치 시각
+            "first_kill_sec":   round(first_sec, 2),
+            "last_kill_sec":    round(last_sec,  2),
+            "clip_start":       round(clip_start, 2),
+            "clip_end":         round(clip_end,   2),
+            "clip_file":        clip_name,
+            "thumb_file":       thumb_name,
+        }
+        detections.append(detection)
+
     # ── 타임코드 로그 저장 ────────────────────────────────────
     print(f"\n{'─'*55}")
-    print(f"  총 탈락 감지: {kill_count}건")
+    print(f"  총 탈락 감지: {raw_count}건  →  클립 {kill_count}개 추출")
     if kill_count > 0:
         save_timecode_log(detections, out_dir, src.name)
         print(f"\n  📂 결과물 위치: {out_dir}")
