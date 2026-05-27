@@ -215,11 +215,13 @@ def process_video(video_path: str):
         print(f"[ERROR] 파일 없음: {video_path}")
         sys.exit(1)
 
-    # 결과물 폴더: 원본명_openclaw/
-    out_dir = src.parent / f"{src.stem}_openclaw"
+    # 결과물 폴더: ~/Desktop/OpenClaw-project/output/원본명_openclaw/
+    OUTPUT_BASE = Path.home() / "Desktop" / "OpenClaw-project" / "output"
+    OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
+    out_dir = OUTPUT_BASE / f"{src.stem}_openclaw"
     out_dir.mkdir(exist_ok=True)
     print(f"\n{'═'*55}")
-    print(f"  OpenClaw v5.1.0")
+    print(f"  OpenClaw v5.2.0")
     print(f"  원본 : {src.name}")
     print(f"  출력 : {out_dir}")
     print(f"{'═'*55}\n")
